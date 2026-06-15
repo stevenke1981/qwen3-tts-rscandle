@@ -18,10 +18,11 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use candle_transformers::quantized_var_builder::VarBuilder;
 use models::talker::{Language, Speaker, TalkerConfig};
 use qwen3_tts::{
     device_info, generation, models, parse_device, tokenizer, AudioBuffer, ModelType,
-    ParsedModelConfig, Qwen3TTS, SynthesisOptions,
+    ParsedModelConfig, QuantizedTalkerModel, Qwen3TTS, SynthesisOptions,
 };
 
 /// Generate reference audio with deterministic seed for comparison
@@ -117,6 +118,14 @@ struct Args {
     /// Device for inference (auto, cpu, cuda, cuda:N, metal)
     #[arg(long, default_value = "auto")]
     device: String,
+
+    /// Use quantized GGUF model instead of safetensors
+    #[arg(long)]
+    quantized: bool,
+
+    /// Path to quantized GGUF model file (required when --quantized is set)
+    #[arg(long)]
+    gguf_path: Option<String>,
 }
 
 /// Metadata for generated audio
@@ -205,6 +214,24 @@ fn validate_args(args: &Args) -> Result<()> {
             "--compare is only supported in the preset speaker code path.\n  \
              Voice cloning uses the high-level API which doesn't emit comparison data."
         );
+    }
+
+    // --quantized requires --gguf-path
+    if args.quantized && args.gguf_path.is_none() {
+        anyhow::bail!("--quantized requires --gguf-path");
+    }
+
+    // --gguf-path without --quantized is a no-op warning
+    if !args.quantized && args.gguf_path.is_some() {
+        anyhow::bail!("--gguf-path requires --quantized");
+    }
+
+    // --quantized is incompatible with voice cloning and voice design (for now)
+    if args.quantized && args.ref_audio.is_some() {
+        anyhow::bail!("--quantized is not yet supported with --ref-audio (voice cloning)");
+    }
+    if args.quantized && args.instruct.is_some() {
+        anyhow::bail!("--quantized is not yet supported with --instruct (VoiceDesign)");
     }
 
     Ok(())
@@ -354,6 +381,197 @@ fn run_voice_design(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Quantized GGUF path: loads talker from GGUF, code predictor + decoder from safetensors.
+///
+/// Since QuantizedCodePredictor doesn't exist yet, the small code predictor
+/// (5 layers, 1024 hidden) is loaded from model.safetensors as regular weights.
+fn run_quantized(args: &Args) -> Result<()> {
+    let gguf_path = args.gguf_path.as_deref().expect("--gguf-path required");
+
+    println!("=== Quantized GGUF Generation ===");
+    println!("Text: {}", args.text);
+    println!("GGUF: {}", gguf_path);
+    println!("Seed: {}", args.seed);
+
+    let device = parse_device(&args.device)?;
+    println!("Device: {}", device_info(&device));
+
+    // Load GGUF model via quantized VarBuilder
+    println!("\nLoading quantized model from GGUF...");
+    let vb = VarBuilder::from_gguf(gguf_path, &device)?;
+    let talker_config = TalkerConfig::default();
+    let hidden_size = talker_config.hidden_size;
+    let talker = QuantizedTalkerModel::from_gguf(vb.pp("talker"), talker_config, &device)?;
+    println!("QuantizedTalkerModel loaded (hidden_size={})", hidden_size,);
+
+    // Load decoder weights (speech tokenizer)
+    let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
+    let decoder_weights = load_weights(&decoder_path, &device)?;
+
+    println!("Creating Decoder12Hz...");
+    let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
+
+    // Load tokenizer
+    let tokenizer_dir = args
+        .tokenizer_dir
+        .clone()
+        .unwrap_or_else(|| args.model_dir.clone());
+    println!("Loading tokenizer from {}...", tokenizer_dir);
+    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+
+    // Tokenize text
+    let input_ids = text_tokenizer.encode(&args.text)?;
+    println!("Input IDs: {:?}", input_ids);
+
+    let speaker: Speaker = args.speaker.parse()?;
+    let language: Language = args.language.parse()?;
+    println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
+
+    let num_frames = max_frames_from_args(args);
+    println!("\nGenerating up to {} frames...", num_frames);
+
+    // Load code predictor from regular safetensors (not quantized — small model)
+    println!("Loading code predictor weights from model.safetensors...");
+    let model_path = Path::new(&args.model_dir).join("model.safetensors");
+    let weights = load_weights(&model_path, &device)?;
+    let cp_weights = filter_weights(&weights, "talker.code_predictor.");
+    let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+    let code_predictor = models::CodePredictor::new(models::CodePredictorConfig::default(), cp_vb)?;
+
+    // Build trailing text embeddings
+    let trailing_text_hidden = if input_ids.len() > 1 {
+        let remaining_proj = talker.get_projected_text_embeddings(&input_ids[1..])?;
+        let tts_eos_embed = talker.get_tts_eos_embed()?;
+        Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+    } else {
+        talker.get_tts_eos_embed()?
+    };
+    let trailing_text_len = trailing_text_hidden.dim(1)?;
+    let tts_pad_embed = talker.get_tts_pad_embed()?;
+    println!("Trailing text length: {} positions", trailing_text_len);
+
+    // Create sampling context with deterministic seed
+    let mut sampling_ctx = generation::SamplingContext::new(Some(args.seed));
+    let gen_config = generation::GenerationConfig {
+        max_new_tokens: num_frames,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        repetition_penalty: args.repetition_penalty,
+        eos_token_id: Some(qwen3_tts::CODEC_EOS_TOKEN_ID),
+        min_new_tokens: 2,
+    };
+
+    // Initialize KV caches
+    let mut kv_caches = talker.new_kv_caches(gen_config.max_new_tokens + 256);
+
+    // Prefill
+    println!("Running prefill...");
+    let (hidden, logits) =
+        talker.prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+    let prefill_len = hidden.dim(1)?;
+    let mut offset = prefill_len;
+    let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+    println!("Prefill length: {} positions", prefill_len);
+
+    // Sample first semantic token
+    let logits_2d = logits.squeeze(1)?;
+    let logits_suppressed = generation::apply_token_suppression(
+        &logits_2d,
+        qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
+        qwen3_tts::CODEC_EOS_TOKEN_ID,
+    )?;
+    let first_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
+    let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+    println!("First semantic token: {}", semantic_token);
+
+    // Generation loop
+    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    let mut cp_kv_caches = code_predictor.new_kv_caches();
+    let progress = ProgressBar::new(num_frames as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames",
+            )?
+            .progress_chars("#>-"),
+    );
+
+    for frame_idx in 0..num_frames {
+        if let Some(eos_id) = gen_config.eos_token_id {
+            if semantic_token == eos_id {
+                println!("\nEOS token {} at frame {} — stopping", eos_id, frame_idx);
+                break;
+            }
+        }
+
+        let semantic_embed = talker.get_codec_embedding(semantic_token)?;
+
+        let acoustic_codes_tensor = code_predictor.generate_acoustic_codes(
+            &last_hidden,
+            &semantic_embed,
+            &mut cp_kv_caches,
+        )?;
+        let acoustic_codes: Vec<u32> = acoustic_codes_tensor.to_vec1()?;
+
+        let mut frame_codes = vec![semantic_token];
+        frame_codes.extend(&acoustic_codes);
+        all_codes.push(frame_codes);
+        progress.inc(1);
+
+        if frame_idx == num_frames - 1 {
+            break;
+        }
+
+        let acoustic_embed_sum =
+            code_predictor.get_acoustic_embeddings_sum(&acoustic_codes, &device)?;
+        let summed = semantic_embed.add(&acoustic_embed_sum)?;
+
+        let text_addition = if frame_idx < trailing_text_len {
+            trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
+        } else {
+            tts_pad_embed.clone()
+        };
+        let step_input = summed.add(&text_addition)?;
+
+        let (h, new_logits) =
+            talker.generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
+        offset += 1;
+        last_hidden = h;
+
+        let logits_2d = new_logits.squeeze(1)?;
+        let logits_suppressed = generation::apply_token_suppression(
+            &logits_2d,
+            qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
+            qwen3_tts::CODEC_EOS_TOKEN_ID,
+        )?;
+        let next_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
+        semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+    }
+
+    progress.finish_with_message("Done generating codes");
+
+    // Decode to audio
+    println!("\nDecoding {} frames to audio...", all_codes.len());
+    let codes_tensor = qwen3_tts::codes_to_tensor(&all_codes, &device)?;
+    let waveform = decoder.decode(&codes_tensor)?;
+    let audio_samples: Vec<f32> = waveform.flatten_all()?.to_vec1()?;
+    println!(
+        "Audio: {} samples ({:.3}s at 24kHz)",
+        audio_samples.len(),
+        audio_samples.len() as f64 / 24000.0
+    );
+
+    // Save WAV
+    let output_path = resolve_output_path(args, num_frames)?;
+    let audio_buffer = AudioBuffer::new(audio_samples, 24000);
+    audio_buffer.save(&output_path)?;
+    println!("Saved WAV to: {}", output_path.display());
+
+    println!("\nGeneration complete!");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Use chrome tracing when `profiling` feature is active, otherwise plain fmt.
     let _profiling_guard = qwen3_tts::profiling::init();
@@ -363,6 +581,11 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     validate_args(&args)?;
+
+    // Quantized GGUF path: loads talker from GGUF + code predictor from safetensors
+    if args.quantized {
+        return run_quantized(&args);
+    }
 
     // Voice clone path: when --ref-audio is provided, use the high-level API
     if args.ref_audio.is_some() {

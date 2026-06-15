@@ -13,6 +13,7 @@ pub mod codec;
 pub mod config;
 pub mod fused_ops;
 pub mod kv_cache;
+pub mod quantized;
 pub mod speaker;
 pub mod talker;
 pub mod transformer;
@@ -22,3 +23,6 @@ pub use config::{ModelType, ParsedModelConfig, Qwen3TTSConfig, SpeakerEncoderCon
 pub use kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
 pub use talker::{TalkerConfig, TalkerModel};
 pub use transformer::{MRoPE, RoPEType, RotaryEmbedding};
+
+// Quantized (GGUF) model variants — enabled by quantized module
+pub use quantized::{QuantizedCodePredictor, QuantizedDecoderLayer, QuantizedTalkerModel};
