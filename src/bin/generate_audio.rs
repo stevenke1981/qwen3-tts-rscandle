@@ -96,11 +96,15 @@ struct Args {
     top_p: f64,
 
     /// Model directory containing model.safetensors
-    #[arg(short, long, default_value = "test_data/model")]
+    #[arg(short, long, default_value = "models/1.7B-CustomVoice")]
     model_dir: String,
 
+    /// Tokenizer directory (shared across all variants)
+    #[arg(short = 't', long, default_value = "models/tokenizer")]
+    tokenizer_dir: String,
+
     /// Output directory for generated files
-    #[arg(short, long, default_value = "test_data/rust_audio")]
+    #[arg(short, long, default_value = "output")]
     output_dir: String,
 
     /// Compare with Python reference output (if exists)
@@ -110,10 +114,6 @@ struct Args {
     /// Python reference directory
     #[arg(long, default_value = "test_data/reference_audio")]
     reference_dir: String,
-
-    /// Tokenizer directory (defaults to model_dir/../tokenizer)
-    #[arg(long)]
-    tokenizer_dir: Option<String>,
 
     /// Speaker name for CustomVoice (ryan, serena, vivian, aiden, etc.)
     #[arg(long, default_value = "ryan")]
@@ -292,7 +292,7 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     println!("Device: {}", device_info(&device));
     let model = Qwen3TTS::from_pretrained_with_tokenizer(
         &args.model_dir,
-        args.tokenizer_dir.as_deref(),
+        Some(&args.tokenizer_dir),
         device,
     )?;
 
@@ -377,7 +377,7 @@ fn run_voice_design(args: &Args) -> Result<()> {
     println!("Device: {}", device_info(&device));
     let model = Qwen3TTS::from_pretrained_with_tokenizer(
         &args.model_dir,
-        args.tokenizer_dir.as_deref(),
+        Some(&args.tokenizer_dir),
         device,
     )?;
 
@@ -467,10 +467,7 @@ fn run_quantized(args: &Args) -> Result<()> {
     };
 
     let tokenizer_handle = {
-        let tokenizer_dir = args
-            .tokenizer_dir
-            .clone()
-            .unwrap_or_else(|| args.model_dir.clone());
+        let tokenizer_dir = args.tokenizer_dir.clone();
         let text = args.text.clone();
         let speaker_str = args.speaker.clone();
         let language_str = args.language.clone();
@@ -796,10 +793,10 @@ fn main() -> Result<()> {
         }
     };
 
-    // Load tokenizer (defaults to model_dir, which has vocab.json + merges.txt)
-    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| args.model_dir.clone());
+    // Load tokenizer
+    let tokenizer_dir = &args.tokenizer_dir;
     println!("Loading tokenizer from {}...", tokenizer_dir);
-    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(tokenizer_dir)?;
 
     // Tokenize text
     let input_ids = text_tokenizer.encode(&args.text)?;
