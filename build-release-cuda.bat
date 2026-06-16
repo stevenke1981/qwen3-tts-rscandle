@@ -18,4 +18,4 @@ echo.
 
 cd /d "%~dp0"
 
-cargo build --release --features gui,cuda --bin gui %*
+cargo build --release --features cli,cuda,gui %*

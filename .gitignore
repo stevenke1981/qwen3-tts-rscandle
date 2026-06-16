@@ -1,6 +1,12 @@
 /target/
 Cargo.lock
 
+# Release packages (large binary ZIPs)
+*.zip
+
+# Generated inference output
+/output/
+
 # Downloaded test data (not tracked in git)
 /test_data/
 

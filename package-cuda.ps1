@@ -2,7 +2,8 @@
 
 $ErrorActionPreference = "Stop"
 $root = "D:\qwen3-tts-rscandle"
-$exe  = "$root\target\release\gui.exe"
+$exeCli = "$root\target\release\generate_audio.exe"
+$exeGui = "$root\target\release\gui.exe"
 $model = "$root\test_data\model"
 
 $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64"
@@ -22,12 +23,13 @@ $vcruntimeDlls = @{
 
 # Output filename with CUDA version tag
 $cudaVer = "13.2"
-$out = "$root\Qwen3-TTS-v0.3.0-cuda$cudaVer-win64.zip"
+$out = "$root\Qwen3-TTS-v0.4.0-cuda$cudaVer-win64.zip"
 
 # --- Verify all files exist ---
 $missing = @()
-if (-not (Test-Path $exe)) { $missing += "gui.exe" }
-if (-not (Test-Path $model)) { $missing += "model/" }
+if (-not (Test-Path $exeCli)) { $missing += "generate_audio.exe" }
+if (-not (Test-Path $exeGui)) { $missing += "gui.exe" }
+if (-not (Test-Path $model))  { $missing += "model/" }
 foreach ($kv in $cudaDlls.GetEnumerator()) {
     if (-not (Test-Path $kv.Value)) { $missing += "CUDA: $($kv.Key)" }
 }
@@ -52,10 +54,11 @@ if (Test-Path $out) { Remove-Item -LiteralPath $out -Force }
 Write-Host "Creating $out ..." -ForegroundColor Cyan
 
 Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::Open($out, [System.IO.Compression.ZipArchiveMode]::Create)
 
 function Add-FileToZip($zip, $sourcePath, $entryName) {
-    $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+    $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Fastest)
     $entryStream = $entry.Open()
     $fileStream = [System.IO.File]::OpenRead($sourcePath)
     try {
@@ -68,9 +71,13 @@ function Add-FileToZip($zip, $sourcePath, $entryName) {
 }
 
 try {
-    # --- gui.exe ---
+    # --- generate_audio.exe (CLI) ---
+    Write-Host "  Adding generate_audio.exe"
+    Add-FileToZip $zip $exeCli "generate_audio.exe"
+
+    # --- gui.exe (GUI) ---
     Write-Host "  Adding gui.exe"
-    Add-FileToZip $zip $exe "gui.exe"
+    Add-FileToZip $zip $exeGui "gui.exe"
 
     # --- CUDA DLLs ---
     foreach ($kv in $cudaDlls.GetEnumerator()) {
