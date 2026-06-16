@@ -577,7 +577,7 @@ impl Qwen3TTS {
 
         // Accumulate frames as GPU tensors: Vec of [16] U32 tensors
         // Deferred to_vec1 at the end eliminates per-frame acoustic code sync.
-        let mut gpu_frames: Vec<Tensor> = Vec::new();
+        let mut gpu_frames: Vec<Tensor> = Vec::with_capacity(gen_config.max_new_tokens);
 
         #[cfg(feature = "profiling")]
         let _gen_span = tracing::info_span!("generate_frames").entered();

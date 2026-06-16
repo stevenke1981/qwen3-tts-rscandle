@@ -512,7 +512,7 @@ fn run_quantized(args: &Args) -> Result<()> {
     println!("First semantic token: {}", semantic_token);
 
     // Generation loop
-    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    let mut all_codes: Vec<Vec<u32>> = Vec::with_capacity(num_frames);
     let mut cp_kv_caches = code_predictor.new_kv_caches();
     let progress = ProgressBar::new(num_frames as u64);
     progress.set_style(
@@ -841,7 +841,7 @@ fn main() -> Result<()> {
     let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
     // Track generated tokens for repetition penalty
-    let mut generated_tokens: Vec<u32> = Vec::new();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(num_frames);
 
     // Apply repetition penalty + token suppression and sample first semantic token
     let logits_2d = logits.squeeze(1)?;
@@ -862,7 +862,7 @@ fn main() -> Result<()> {
     println!("First semantic token: {}", semantic_token);
 
     // Collect all codes
-    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    let mut all_codes: Vec<Vec<u32>> = Vec::with_capacity(num_frames);
     let mut cp_kv_caches = code_predictor.new_kv_caches();
 
     // Generation loop: for each frame, generate acoustic codes, then prepare next step
