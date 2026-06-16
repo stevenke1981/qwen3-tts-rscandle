@@ -442,7 +442,26 @@ fn run_quantized(args: &Args) -> Result<()> {
         let model_dir = args.model_dir.clone();
         std::thread::spawn(move || -> anyhow::Result<models::codec::Decoder12Hz> {
             let decoder_path = Path::new(&model_dir).join("speech_tokenizer/model.safetensors");
-            let decoder_weights = load_weights(&decoder_path, &device)?;
+            let decoder_weights = if decoder_path.exists() {
+                load_weights(&decoder_path, &device)?
+            } else {
+                let alt = Path::new(&model_dir)
+                    .parent()
+                    .map(|p| p.join("speech_tokenizer/model.safetensors"));
+                if let Some(ref alt_path) = alt {
+                    if alt_path.exists() {
+                        load_weights(alt_path, &device)?
+                    } else {
+                        anyhow::bail!(
+                            "Speech tokenizer not found at {} or {}",
+                            decoder_path.display(),
+                            alt_path.display()
+                        );
+                    }
+                } else {
+                    anyhow::bail!("Speech tokenizer not found at {}", decoder_path.display());
+                }
+            };
             models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())
         })
     };
@@ -750,8 +769,32 @@ fn main() -> Result<()> {
     let model_path = Path::new(&args.model_dir).join("model.safetensors");
     let weights = load_weights(&model_path, &device)?;
 
+    // Try model_dir/speech_tokenizer/model.safetensors first,
+    // then fall back to parent/speech_tokenizer/model.safetensors
     let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
-    let decoder_weights = load_weights(&decoder_path, &device)?;
+    let decoder_weights = if decoder_path.exists() {
+        load_weights(&decoder_path, &device)?
+    } else {
+        let alt = Path::new(&args.model_dir)
+            .parent()
+            .map(|p| p.join("speech_tokenizer/model.safetensors"));
+        if let Some(ref alt_path) = alt {
+            if alt_path.exists() {
+                load_weights(alt_path, &device)?
+            } else {
+                anyhow::bail!(
+                    "Speech tokenizer weights not found at {} or {}",
+                    decoder_path.display(),
+                    alt_path.display()
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "Speech tokenizer weights not found at {}",
+                decoder_path.display()
+            );
+        }
+    };
 
     // Load tokenizer (defaults to model_dir, which has vocab.json + merges.txt)
     let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| args.model_dir.clone());
