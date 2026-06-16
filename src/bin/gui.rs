@@ -17,6 +17,41 @@ use egui::{Color32, ProgressBar as EguiProgressBar, RichText, ScrollArea, TextEd
 use qwen3_tts::i18n::{Locale, Tr, SPEAKERS};
 use qwen3_tts::{parse_device, AudioBuffer, Qwen3TTS, SynthesisOptions};
 
+/// Available model variants shown in the GUI model selector.
+/// Order: most recommended first.
+const MODEL_VARIANTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "1.7B CustomVoice",
+        "models/1.7B-CustomVoice",
+        "9 preset speakers",
+        "models/tokenizer",
+    ),
+    (
+        "1.7B Base",
+        "models/1.7B-Base",
+        "Voice cloning (ref audio)",
+        "models/tokenizer",
+    ),
+    (
+        "1.7B VoiceDesign",
+        "models/1.7B-VoiceDesign",
+        "Text-described voices",
+        "models/tokenizer",
+    ),
+    (
+        "0.6B CustomVoice",
+        "models/0.6B-CustomVoice",
+        "9 preset speakers (small)",
+        "models/tokenizer",
+    ),
+    (
+        "0.6B Base",
+        "models/0.6B-Base",
+        "Voice cloning (ref audio, small)",
+        "models/tokenizer",
+    ),
+];
+
 // ── Shared progress between UI thread and background worker ─────────────────────
 
 #[derive(Clone, Default)]
@@ -54,7 +89,9 @@ struct TtsApp {
     top_k: u32,
     top_p: f64,
     rep_penalty: f64,
+    model_variant_idx: usize,
     model_dir: String,
+    tokenizer_dir: String,
     output_dir: String,
 
     // UI settings
@@ -87,7 +124,9 @@ impl Default for TtsApp {
             top_k: 50,
             top_p: 0.9,
             rep_penalty: 1.05,
-            model_dir: "model".into(),
+            model_variant_idx: 0,
+            model_dir: MODEL_VARIANTS[0].1.into(),
+            tokenizer_dir: MODEL_VARIANTS[0].3.into(),
             output_dir: "output/voice".into(),
             locale: Locale::ZhTw,
             batch: Vec::new(),
@@ -121,6 +160,7 @@ impl TtsApp {
 
         let progress = self.progress.clone();
         let model_dir = self.model_dir.clone();
+        let tokenizer_dir = self.tokenizer_dir.clone();
         let output_dir = self.output_dir.clone();
         let speaker = SPEAKERS[self.speaker_idx].to_string();
         let langs = self.tr().languages();
@@ -139,6 +179,7 @@ impl TtsApp {
             let result = run_generation(
                 &text,
                 &model_dir,
+                &tokenizer_dir,
                 &output_dir,
                 &speaker,
                 &language,
@@ -242,6 +283,7 @@ struct GeneratedAudio {
 fn run_generation(
     text: &str,
     model_dir: &str,
+    tokenizer_dir: &str,
     output_dir: &str,
     speaker: &str,
     language: &str,
@@ -264,7 +306,7 @@ fn run_generation(
     let device = parse_device("auto")?;
     let _device_name = qwen3_tts::device_info(&device);
 
-    let model = Qwen3TTS::from_pretrained(model_dir, device)?;
+    let model = Qwen3TTS::from_pretrained_with_tokenizer(model_dir, Some(tokenizer_dir), device)?;
 
     let spk: qwen3_tts::Speaker = speaker.parse()?;
     let lang: qwen3_tts::Language = language.parse()?;
@@ -346,11 +388,29 @@ impl eframe::App for TtsApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
-        // ── Top bar: paths and language switcher ─────────────────────────────
+        // ── Top bar: model variant selector, output path, language switcher ──
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tr.model_label()).color(Color32::from_rgb(180, 180, 180)));
-                ui.text_edit_singleline(&mut self.model_dir);
+                let prev_idx = self.model_variant_idx;
+                egui::ComboBox::from_id_salt("model_variant")
+                    .width(200.0)
+                    .selected_text(MODEL_VARIANTS[self.model_variant_idx].0)
+                    .show_ui(ui, |ui| {
+                        for (i, &(label, _dir, desc, _tok)) in MODEL_VARIANTS.iter().enumerate() {
+                            let text = format!("{}  — {}", label, desc);
+                            if ui
+                                .selectable_label(self.model_variant_idx == i, &text)
+                                .clicked()
+                            {
+                                self.model_variant_idx = i;
+                            }
+                        }
+                    });
+                if prev_idx != self.model_variant_idx {
+                    self.model_dir = MODEL_VARIANTS[self.model_variant_idx].1.into();
+                    self.tokenizer_dir = MODEL_VARIANTS[self.model_variant_idx].3.into();
+                }
                 ui.separator();
                 ui.label(RichText::new(tr.output_label()).color(Color32::from_rgb(180, 180, 180)));
                 ui.text_edit_singleline(&mut self.output_dir);
