@@ -78,6 +78,12 @@ pub struct QuantizedTalkerModel {
     config: TalkerConfig,
     /// Device
     device: Device,
+    /// Cached tts_pad projected embedding [1, 1, hidden_size]
+    cached_tts_pad: Tensor,
+    /// Cached tts_eos projected embedding [1, 1, hidden_size]
+    cached_tts_eos: Tensor,
+    /// Cached tts_bos projected embedding [1, 1, hidden_size]
+    cached_tts_bos: Tensor,
 }
 
 impl QuantizedTalkerModel {
@@ -135,6 +141,23 @@ impl QuantizedTalkerModel {
             )?)
         };
 
+        // Cache constant projected embeddings for generation
+        let cached_tts_pad = {
+            let id = Tensor::new(&[tts_tokens::TTS_PAD], device)?;
+            let embed = text_embedding.forward(&id)?.unsqueeze(0)?;
+            text_projection.forward(&embed)?
+        };
+        let cached_tts_eos = {
+            let id = Tensor::new(&[tts_tokens::TTS_EOS], device)?;
+            let embed = text_embedding.forward(&id)?.unsqueeze(0)?;
+            text_projection.forward(&embed)?
+        };
+        let cached_tts_bos = {
+            let id = Tensor::new(&[tts_tokens::TTS_BOS], device)?;
+            let embed = text_embedding.forward(&id)?.unsqueeze(0)?;
+            text_projection.forward(&embed)?
+        };
+
         Ok(Self {
             text_embedding,
             text_projection,
@@ -145,6 +168,9 @@ impl QuantizedTalkerModel {
             rope,
             config,
             device: device.clone(),
+            cached_tts_pad,
+            cached_tts_eos,
+            cached_tts_bos,
         })
     }
 
@@ -471,20 +497,12 @@ impl QuantizedTalkerModel {
     /// Build tts_pad (projected, count copies) and tts_bos (projected, 1 copy).
     ///
     /// Returns a `[1, pad_count + 1, hidden_size]` tensor of
-    /// `[tts_pad × pad_count, tts_bos × 1]`.
+    /// `[tts_pad × pad_count, tts_bos × 1]`. Uses cached embeddings.
     fn build_tts_pad_bos(&self, pad_count: usize) -> Result<Tensor> {
-        use tts_tokens::*;
-        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?.unsqueeze(0)?;
-        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?;
-
-        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?.unsqueeze(0)?;
-        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?;
-
         let tts_pad_expanded =
-            tts_pad_proj.broadcast_as((1, pad_count, self.config.hidden_size))?;
-        Ok(Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?)
+            self.cached_tts_pad
+                .broadcast_as((1, pad_count, self.config.hidden_size))?;
+        Ok(Tensor::cat(&[&tts_pad_expanded, &self.cached_tts_bos], 1)?)
     }
 
     /// Build first text token combined with codec_bos embedding.
@@ -566,27 +584,18 @@ impl QuantizedTalkerModel {
 
     // ─── Embedding Helpers ───────────────────────────────────────────────────
 
-    /// Get the projected text embedding for a single special token.
-    ///
-    /// Returns a `[1, 1, hidden_size]` tensor.
-    fn get_projected_special_embed(&self, token_id: u32) -> Result<Tensor> {
-        let id = Tensor::new(&[token_id], &self.device)?;
-        let embed = self.text_embedding.forward(&id)?.unsqueeze(0)?;
-        self.text_projection.forward(&embed)
-    }
-
-    /// Get tts_pad text embedding (projected).
+    /// Get tts_pad text embedding (projected) — cached.
     ///
     /// This is added to codec embeddings during generation after trailing text is exhausted.
     pub fn get_tts_pad_embed(&self) -> Result<Tensor> {
-        self.get_projected_special_embed(tts_tokens::TTS_PAD)
+        Ok(self.cached_tts_pad.clone())
     }
 
-    /// Get tts_eos text embedding (projected).
+    /// Get tts_eos text embedding (projected) — cached.
     ///
     /// This marks the end of text input.
     pub fn get_tts_eos_embed(&self) -> Result<Tensor> {
-        self.get_projected_special_embed(tts_tokens::TTS_EOS)
+        Ok(self.cached_tts_eos.clone())
     }
 
     /// Get projected text embeddings for a sequence of token IDs.

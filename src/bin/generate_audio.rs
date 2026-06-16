@@ -22,8 +22,44 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 use models::talker::{Language, Speaker, TalkerConfig};
 use qwen3_tts::{
     device_info, generation, models, parse_device, tokenizer, AudioBuffer, ModelType,
-    ParsedModelConfig, QuantizedTalkerModel, Qwen3TTS, SynthesisOptions,
+    ParsedModelConfig, QuantizedCodePredictor, QuantizedTalkerModel, Qwen3TTS, SynthesisOptions,
 };
+
+/// Wrapper enum for F32 vs quantized code predictor
+enum CpVariant {
+    F32(models::CodePredictor),
+    Q(QuantizedCodePredictor),
+}
+
+impl CpVariant {
+    fn new_kv_caches(&self) -> Vec<models::AnyKVCache> {
+        match self {
+            Self::F32(cp) => cp.new_kv_caches(),
+            Self::Q(cp) => cp.new_kv_caches(),
+        }
+    }
+
+    fn generate_acoustic_codes(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cp_kv_caches: &mut [models::AnyKVCache],
+    ) -> anyhow::Result<Tensor> {
+        match self {
+            Self::F32(cp) => {
+                cp.generate_acoustic_codes(talker_hidden, semantic_embed, cp_kv_caches)
+            }
+            Self::Q(cp) => cp.generate_acoustic_codes(talker_hidden, semantic_embed, cp_kv_caches),
+        }
+    }
+
+    fn get_acoustic_embeddings_sum_from_tensor(&self, codes: &Tensor) -> anyhow::Result<Tensor> {
+        match self {
+            Self::F32(cp) => cp.get_acoustic_embeddings_sum_from_tensor(codes),
+            Self::Q(cp) => cp.get_acoustic_embeddings_sum_from_tensor(codes),
+        }
+    }
+}
 
 /// Generate reference audio with deterministic seed for comparison
 #[derive(Parser, Debug)]
@@ -399,7 +435,38 @@ fn run_quantized(args: &Args) -> Result<()> {
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
 
-    // ── Load GGUF model ──────────────────────────────────────────────────────
+    // ── Parallel loading ─────────────────────────────────────────────────────
+    // Spawn decoder and tokenizer in background threads while loading GGUF (heaviest)
+    let decoder_handle = {
+        let device = device.clone();
+        let model_dir = args.model_dir.clone();
+        std::thread::spawn(move || -> anyhow::Result<models::codec::Decoder12Hz> {
+            let decoder_path = Path::new(&model_dir).join("speech_tokenizer/model.safetensors");
+            let decoder_weights = load_weights(&decoder_path, &device)?;
+            models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())
+        })
+    };
+
+    let tokenizer_handle = {
+        let tokenizer_dir = args
+            .tokenizer_dir
+            .clone()
+            .unwrap_or_else(|| args.model_dir.clone());
+        let text = args.text.clone();
+        let speaker_str = args.speaker.clone();
+        let language_str = args.language.clone();
+        std::thread::spawn(
+            move || -> anyhow::Result<(tokenizer::TextTokenizer, Vec<u32>, Speaker, Language)> {
+                let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+                let input_ids = text_tokenizer.encode(&text)?;
+                let speaker: Speaker = speaker_str.parse()?;
+                let language: Language = language_str.parse()?;
+                Ok((text_tokenizer, input_ids, speaker, language))
+            },
+        )
+    };
+
+    // Load GGUF on main thread (parallel with decoder + tokenizer)
     println!("\nLoading quantized model from GGUF...");
     let vb = VarBuilder::from_gguf(gguf_path, &device)?;
     let talker_config = if args.custom_voice {
@@ -415,46 +482,46 @@ fn run_quantized(args: &Args) -> Result<()> {
         "QuantizedTalkerModel loaded (hidden_size={}) — {:.2}s",
         hidden_size, t_gguf
     );
+
+    // Join parallel background tasks (should be instant since they ran alongside GGUF)
+    let decoder = match decoder_handle.join() {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("Decoder thread panicked"),
+    };
+    let (_text_tokenizer, input_ids, speaker, language) = match tokenizer_handle.join() {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("Tokenizer thread panicked"),
+    };
+    // Reset timer for next phase (exclude parallel load overhead)
     phase = std::time::Instant::now();
 
-    // ── Load decoder ──────────────────────────────────────────────────────────
-    let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
-    let decoder_weights = load_weights(&decoder_path, &device)?;
-    println!("Creating Decoder12Hz...");
-    let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
-    let t_decoder = phase.elapsed().as_secs_f64();
-    println!("Decoder loaded — {:.2}s", t_decoder);
-    phase = std::time::Instant::now();
-
-    // ── Load tokenizer & tokenize ─────────────────────────────────────────────
-    let tokenizer_dir = args
-        .tokenizer_dir
-        .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
-    println!("Loading tokenizer from {}...", tokenizer_dir);
-    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
-    let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
-    let speaker: Speaker = args.speaker.parse()?;
-    let language: Language = args.language.parse()?;
-    println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
     let num_frames = max_frames_from_args(args);
     println!("\nGenerating up to {} frames...", num_frames);
-    let t_tokenizer = phase.elapsed().as_secs_f64();
-    phase = std::time::Instant::now();
 
     // ── Load code predictor ──────────────────────────────────────────────────
-    println!("Loading code predictor weights from model.safetensors...");
-    let model_path = Path::new(&args.model_dir).join("model.safetensors");
-    let weights = load_weights(&model_path, &device)?;
-    let cp_weights = filter_weights(&weights, "talker.code_predictor.");
-    let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
     let cp_config = if args.custom_voice {
         models::CodePredictorConfig::custom_voice()
     } else {
         models::CodePredictorConfig::default()
     };
-    let code_predictor = models::CodePredictor::new(cp_config, cp_vb)?;
+    let code_predictor = if vb.contains_key("talker.code_predictor.model.norm.weight") {
+        println!("Loading code predictor from GGUF (quantized)...");
+        CpVariant::Q(QuantizedCodePredictor::new(
+            cp_config,
+            vb.pp("talker.code_predictor"),
+        )?)
+    } else {
+        println!("Loading code predictor weights from model.safetensors...");
+        let model_path = Path::new(&args.model_dir).join("model.safetensors");
+        let weights = load_weights(&model_path, &device)?;
+        let cp_weights = filter_weights(&weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let cp = models::CodePredictor::new(cp_config, cp_vb)?;
+        CpVariant::F32(cp)
+    };
     let t_cp = phase.elapsed().as_secs_f64();
     println!("Code predictor loaded — {:.2}s", t_cp);
     phase = std::time::Instant::now();
@@ -508,11 +575,12 @@ fn run_quantized(args: &Args) -> Result<()> {
         qwen3_tts::CODEC_EOS_TOKEN_ID,
     )?;
     let first_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
-    let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-    println!("First semantic token: {}", semantic_token);
+    let mut semantic_token_tensor = first_token.flatten_all()?; // [1] tensor on GPU
+    let _first_semantic: u32 = semantic_token_tensor.to_vec1::<u32>()?[0];
+    println!("First semantic token: {}", _first_semantic);
 
-    // Generation loop
-    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    // Generation loop — keep everything on GPU, single per-frame sync for EOS check
+    let mut gpu_frames: Vec<Tensor> = Vec::with_capacity(num_frames);
     let mut cp_kv_caches = code_predictor.new_kv_caches();
     let progress = ProgressBar::new(num_frames as u64);
     progress.set_style(
@@ -524,6 +592,8 @@ fn run_quantized(args: &Args) -> Result<()> {
     );
 
     for frame_idx in 0..num_frames {
+        // EOS check — one scalar sync per frame (~0.01ms on CUDA)
+        let semantic_token: u32 = semantic_token_tensor.to_vec1::<u32>()?[0];
         if let Some(eos_id) = gen_config.eos_token_id {
             if semantic_token == eos_id {
                 println!("\nEOS token {} at frame {} — stopping", eos_id, frame_idx);
@@ -531,26 +601,29 @@ fn run_quantized(args: &Args) -> Result<()> {
             }
         }
 
-        let semantic_embed = talker.get_codec_embedding(semantic_token)?;
+        // GPU-resident embedding lookup (no CPU→GPU transfer)
+        let semantic_embed = talker.get_codec_embedding_from_tensor(&semantic_token_tensor)?;
 
         let acoustic_codes_tensor = code_predictor.generate_acoustic_codes(
             &last_hidden,
             &semantic_embed,
             &mut cp_kv_caches,
         )?;
-        let acoustic_codes: Vec<u32> = acoustic_codes_tensor.to_vec1()?;
 
-        let mut frame_codes = vec![semantic_token];
-        frame_codes.extend(&acoustic_codes);
-        all_codes.push(frame_codes);
+        // Accumulate frame as GPU tensor [semantic, 15 acoustics] — no CPU→GPU sync
+        gpu_frames.push(Tensor::cat(
+            &[&semantic_token_tensor.reshape(1)?, &acoustic_codes_tensor],
+            0,
+        )?);
         progress.inc(1);
 
         if frame_idx == num_frames - 1 {
             break;
         }
 
+        // GPU tensor embedding sum (avoids 15 individual CPU→GPU transfers)
         let acoustic_embed_sum =
-            code_predictor.get_acoustic_embeddings_sum(&acoustic_codes, &device)?;
+            code_predictor.get_acoustic_embeddings_sum_from_tensor(&acoustic_codes_tensor)?;
         let summed = semantic_embed.add(&acoustic_embed_sum)?;
 
         let text_addition = if frame_idx < trailing_text_len {
@@ -571,17 +644,26 @@ fn run_quantized(args: &Args) -> Result<()> {
             qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
             qwen3_tts::CODEC_EOS_TOKEN_ID,
         )?;
-        let next_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
-        semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+        semantic_token_tensor =
+            generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
     }
 
     let t_gen = phase.elapsed().as_secs_f64();
     progress.finish_with_message("Done generating codes");
     phase = std::time::Instant::now();
 
-    // Decode to audio
-    println!("\nDecoding {} frames to audio...", all_codes.len());
-    let codes_tensor = qwen3_tts::codes_to_tensor(&all_codes, &device)?;
+    // Single GPU→CPU transfer + build [1, 16, num_frames] decoder tensor
+    let num_final_frames = gpu_frames.len();
+    println!("\nDecoding {} frames to audio...", num_final_frames);
+    let codes_tensor = if gpu_frames.is_empty() {
+        Tensor::zeros((1, 16, 0), DType::I64, &device)?
+    } else {
+        let stacked = Tensor::stack(&gpu_frames, 0)?; // [n, 16] U32 on GPU
+        stacked
+            .transpose(0, 1)? // [16, n]
+            .unsqueeze(0)? // [1, 16, n]
+            .to_dtype(DType::I64)?
+    };
     let waveform = decoder.decode(&codes_tensor)?;
     let audio_samples: Vec<f32> = waveform.flatten_all()?.to_vec1()?;
     println!(
@@ -598,16 +680,14 @@ fn run_quantized(args: &Args) -> Result<()> {
 
     println!();
     println!("=== Timing Summary ===");
-    println!("  Load GGUF:        {:>8.2}s", t_gguf);
-    println!("  Load decoder:     {:>8.2}s", t_decoder);
-    println!("  Tokenizer:        {:>8.2}s", t_tokenizer);
+    println!("  Load GGUF+tok+dec: {:>8.2}s *", t_gguf);
     println!("  Load CP:          {:>8.2}s", t_cp);
     println!("  Prefill:          {:>8.2}s", t_prefill);
     println!(
         "  Generation:       {:>8.2}s  ({} frames, {:.1}s/frame)",
         t_gen,
-        all_codes.len(),
-        t_gen / all_codes.len().max(1) as f64
+        num_final_frames,
+        t_gen / num_final_frames.max(1) as f64
     );
     println!("  Decode + save:    {:>8.2}s", t_decode_save);
     println!("  ──────────────────────────────────────");
@@ -841,7 +921,7 @@ fn main() -> Result<()> {
     let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
     // Track generated tokens for repetition penalty
-    let mut generated_tokens: Vec<u32> = Vec::new();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(num_frames);
 
     // Apply repetition penalty + token suppression and sample first semantic token
     let logits_2d = logits.squeeze(1)?;
@@ -857,17 +937,18 @@ fn main() -> Result<()> {
         qwen3_tts::CODEC_EOS_TOKEN_ID,
     )?;
     let first_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
-    let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-    generated_tokens.push(semantic_token);
-    println!("First semantic token: {}", semantic_token);
+    let mut semantic_token_tensor = first_token.flatten_all()?; // [1] tensor on GPU
+    let _first_semantic: u32 = semantic_token_tensor.to_vec1::<u32>()?[0];
+    generated_tokens.push(_first_semantic);
+    println!("First semantic token: {}", _first_semantic);
 
-    // Collect all codes
-    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    // Generation loop — keep semantic_token on GPU, single sync per frame for EOS
+    let mut gpu_frames: Vec<Tensor> = Vec::with_capacity(num_frames);
     let mut cp_kv_caches = code_predictor.new_kv_caches();
 
-    // Generation loop: for each frame, generate acoustic codes, then prepare next step
     for frame_idx in 0..num_frames {
-        // Check EOS before processing this frame
+        // EOS check — one scalar sync per frame
+        let semantic_token: u32 = semantic_token_tensor.to_vec1::<u32>()?[0];
         if let Some(eos_id) = gen_config.eos_token_id {
             if semantic_token == eos_id {
                 println!(
@@ -878,46 +959,42 @@ fn main() -> Result<()> {
             }
         }
 
-        // Get semantic token embedding
-        let semantic_embed = talker.get_codec_embedding(semantic_token)?;
+        // GPU-resident embedding lookup (no CPU→GPU transfer)
+        let semantic_embed = talker.get_codec_embedding_from_tensor(&semantic_token_tensor)?;
 
-        // Generate 15 acoustic codes using code predictor
         let acoustic_codes_tensor = code_predictor.generate_acoustic_codes(
             &last_hidden,
             &semantic_embed,
             &mut cp_kv_caches,
         )?;
-        let acoustic_codes: Vec<u32> = acoustic_codes_tensor.to_vec1()?;
+
+        // Accumulate frame as GPU tensor
+        gpu_frames.push(Tensor::cat(
+            &[&semantic_token_tensor.reshape(1)?, &acoustic_codes_tensor],
+            0,
+        )?);
 
         if frame_idx < 5 || frame_idx == num_frames - 1 {
+            let debug_codes: Vec<u32> = acoustic_codes_tensor.narrow(0, 0, 3)?.to_vec1::<u32>()?;
             println!(
                 "Frame {}: semantic={}, acoustics={:?}...",
-                frame_idx,
-                semantic_token,
-                &acoustic_codes[..3.min(acoustic_codes.len())]
+                frame_idx, semantic_token, &debug_codes
             );
         } else if frame_idx == 5 {
             println!("...");
         }
 
-        // Save frame codes [semantic, acoustic_0, ..., acoustic_14]
-        let mut frame_codes = vec![semantic_token];
-        frame_codes.extend(&acoustic_codes);
-        all_codes.push(frame_codes);
         progress.inc(1);
 
-        // If this is the last frame, we're done
         if frame_idx == num_frames - 1 {
             break;
         }
 
-        // Build input for next talker step:
-        // Sum all 16 code embeddings (residual VQ pattern: semantic + 15 acoustic)
+        // GPU tensor embedding sum (avoids 15 individual CPU→GPU transfers)
         let acoustic_embed_sum =
-            code_predictor.get_acoustic_embeddings_sum(&acoustic_codes, &device)?;
+            code_predictor.get_acoustic_embeddings_sum_from_tensor(&acoustic_codes_tensor)?;
         let summed = semantic_embed.add(&acoustic_embed_sum)?;
 
-        // Add trailing text embedding (or tts_pad if trailing text is exhausted)
         let text_addition = if frame_idx < trailing_text_len {
             trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
         } else {
@@ -925,15 +1002,14 @@ fn main() -> Result<()> {
         };
         let step_input = summed.add(&text_addition)?;
 
-        // Run through talker to get next hidden state and logits
         let (h, new_logits) =
             talker.generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
         offset += 1;
         last_hidden = h;
 
-        // Sample next semantic token with repetition penalty + token suppression
+        // Sample next semantic token with repetition penalty (CPU-generated_tokens path)
         let logits_2d = new_logits.squeeze(1)?;
-        let logits_2d = if gen_config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+        let logits_2d = if gen_config.repetition_penalty != 1.0 {
             let prev = Tensor::new(generated_tokens.as_slice(), &device)?;
             generation::apply_repetition_penalty(&logits_2d, &prev, gen_config.repetition_penalty)?
         } else {
@@ -944,24 +1020,46 @@ fn main() -> Result<()> {
             qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
             qwen3_tts::CODEC_EOS_TOKEN_ID,
         )?;
-        let next_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
-        semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
+        semantic_token_tensor =
+            generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
+        let new_token: u32 = semantic_token_tensor.to_vec1::<u32>()?[0];
+        generated_tokens.push(new_token);
     }
 
     progress.finish_with_message("Done generating codes");
 
-    // Convert to tensor [1, 16, num_frames]
-    let codes_tensor = qwen3_tts::codes_to_tensor(&all_codes, &device)?;
+    // Single GPU→CPU transfer + build [1, 16, num_frames] decoder tensor
+    let num_final_frames = gpu_frames.len();
+    let codes_tensor = if gpu_frames.is_empty() {
+        Tensor::zeros((1, 16, 0), DType::I64, &device)?
+    } else {
+        let stacked = Tensor::stack(&gpu_frames, 0)?; // [n, 16] U32 on GPU
+        stacked
+            .transpose(0, 1)? // [16, n]
+            .unsqueeze(0)? // [1, 16, n]
+            .to_dtype(DType::I64)?
+    };
     println!("\nCodes tensor shape: {:?}", codes_tensor.shape());
 
-    // Save codes as binary
+    // Save codes as binary (single to_vec1 after generation completes)
+    let all_codes_flat: Vec<u32> = if num_final_frames > 0 {
+        Tensor::stack(&gpu_frames, 0)?
+            .flatten_all()?
+            .to_vec1::<u32>()?
+    } else {
+        Vec::new()
+    };
+    let mut all_codes: Vec<Vec<u32>> = Vec::with_capacity(num_final_frames);
+    for f in 0..num_final_frames {
+        let start = f * 16;
+        all_codes.push(all_codes_flat[start..start + 16].to_vec());
+    }
     let codes_bin_path =
         output_dir.join(format!("codes_seed{}_frames{}.bin", args.seed, num_frames));
     save_codes_binary(&all_codes, &codes_bin_path)?;
     println!("Saved binary codes to: {:?}", codes_bin_path);
 
-    // Decode to audio
+    // Decode to audio (GPU tensor already on device)
     println!("\nDecoding to audio...");
     let waveform = decoder.decode(&codes_tensor)?;
     let audio_samples: Vec<f32> = waveform.flatten_all()?.to_vec1()?;
