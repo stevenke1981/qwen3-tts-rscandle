@@ -14,7 +14,7 @@ fn load_model(model_dir: &str) -> Qwen3TTS {
 #[test]
 #[ignore = "requires model weights + GPU"]
 fn test_streaming_custom_voice() {
-    let model = load_model("test_data/models/1.7B-CustomVoice");
+    let model = load_model("models/1.7B-CustomVoice");
 
     let options = SynthesisOptions {
         seed: Some(42),
@@ -59,7 +59,7 @@ fn test_streaming_custom_voice() {
 #[test]
 #[ignore = "requires model weights + GPU"]
 fn test_streaming_voice_design() {
-    let model = load_model("test_data/models/1.7B-VoiceDesign");
+    let model = load_model("models/1.7B-VoiceDesign");
 
     let options = SynthesisOptions {
         seed: Some(42),
@@ -106,7 +106,7 @@ fn test_streaming_voice_design() {
 fn test_streaming_matches_non_streaming() {
     // Verify that streaming and non-streaming produce the same number of
     // samples for the same seed (deterministic generation).
-    let model = load_model("test_data/models/1.7B-CustomVoice");
+    let model = load_model("models/1.7B-CustomVoice");
 
     let make_options = || SynthesisOptions {
         seed: Some(123),

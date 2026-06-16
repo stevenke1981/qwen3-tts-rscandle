@@ -1521,6 +1521,8 @@ pub struct StreamingSession<'a> {
     suppression_mask: generation::SuppressionMask,
     // Pre-allocated code predictor KV caches (reused + reset each frame)
     cp_kv_caches: Vec<AnyKVCache>,
+    /// Optional per-frame progress callback.
+    on_frame: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1553,6 +1555,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
+            options.on_frame,
         )
     }
 
@@ -1589,6 +1592,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
+            options.on_frame,
         )
     }
 
@@ -1607,6 +1611,7 @@ impl<'a> StreamingSession<'a> {
         trailing_text_len: usize,
         tts_pad_embed: Tensor,
         chunk_frames: usize,
+        on_frame: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
     ) -> Result<Self> {
         let (hidden, logits) = prefill_result;
         let prefill_len = hidden.dim(1)?;
@@ -1657,6 +1662,7 @@ impl<'a> StreamingSession<'a> {
             token_count: 1,
             suppression_mask,
             cp_kv_caches,
+            on_frame,
         })
     }
 
@@ -1709,6 +1715,11 @@ impl<'a> StreamingSession<'a> {
 
             let frame_idx = self.frames_generated;
             self.frames_generated += 1;
+
+            // Notify progress callback (if set)
+            if let Some(ref cb) = self.on_frame {
+                cb(self.frames_generated, self.config.max_new_tokens);
+            }
 
             // Build residual VQ sum + trailing text for next step
             let acoustic_embed_sum = self
