@@ -81,13 +81,19 @@ pub struct QuantizedTalkerModel {
 }
 
 impl QuantizedTalkerModel {
-    /// Load model from a pre-built quantized VarBuilder (GGUF path).
+    /// Load model from a pre-built quantized VarBuilder scoped to `talker.`.
     ///
     /// The `VarBuilder` should be constructed from quantized (QTensor) weights
-    /// via `candle_transformers::quantized_var_builder::VarBuilder::from_gguf()`.
+    /// via `candle_transformers::quantized_var_builder::VarBuilder::from_gguf()`
+    /// and then *pp()'d to the `talker` prefix (the caller is responsible for
+    /// the top-level scope — we do NOT prepend another `talker.`).
     pub fn from_gguf(vb: VarBuilder, config: TalkerConfig, device: &Device) -> Result<Self> {
-        let talker = vb.pp("talker");
-        let model = talker.pp("model");
+        // Naming: the caller already scopes us to `talker.` so `vb` points at the
+        // `talker` prefix level.  The GGUF file contains tensors named:
+        //   talker.model.*           (text_embedding, codec_embedding, norm, layers)
+        //   talker.codec_head
+        //   talker.text_projection.*
+        let model = vb.pp("model");
         let layer_config = config.to_layer_config();
 
         let text_embedding = Embedding::new(
@@ -95,7 +101,7 @@ impl QuantizedTalkerModel {
             config.text_embed_dim,
             model.pp("text_embedding"),
         )?;
-        let text_projection = QuantizedTextProjection::new(&config, talker.pp("text_projection"))?;
+        let text_projection = QuantizedTextProjection::new(&config, vb.pp("text_projection"))?;
         let codec_embedding = Embedding::new(
             config.codec_vocab_size,
             config.hidden_size,
@@ -105,7 +111,7 @@ impl QuantizedTalkerModel {
         let codec_head = quantized_nn::linear_no_bias(
             config.hidden_size,
             config.codec_vocab_size,
-            talker.pp("codec_head"),
+            vb.pp("codec_head"),
         )?;
 
         let layers = (0..config.num_hidden_layers)

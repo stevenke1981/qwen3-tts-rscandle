@@ -12,9 +12,8 @@
 //! ```rust,ignore
 //! use candle_transformers::quantized_var_builder::VarBuilder;
 //!
-//! let vb = VarBuilder::from_gguff("model.gguf", &device)?;
+//! let vb = VarBuilder::from_gguf("model.gguf", &device)?;
 //! let talker = QuantizedTalkerModel::from_gguf(vb.pp("talker"), config_talker, &device)?;
-//! let cp = QuantizedCodePredictor::new(config_cp, vb.pp("talker.code_predictor"))?;
 //! ```
 
 mod code_predictor;

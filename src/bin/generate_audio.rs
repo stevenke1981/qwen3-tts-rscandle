@@ -386,6 +386,9 @@ fn run_voice_design(args: &Args) -> Result<()> {
 /// Since QuantizedCodePredictor doesn't exist yet, the small code predictor
 /// (5 layers, 1024 hidden) is loaded from model.safetensors as regular weights.
 fn run_quantized(args: &Args) -> Result<()> {
+    let start_all = std::time::Instant::now();
+    let mut phase = std::time::Instant::now();
+
     let gguf_path = args.gguf_path.as_deref().expect("--gguf-path required");
 
     println!("=== Quantized GGUF Generation ===");
@@ -396,47 +399,65 @@ fn run_quantized(args: &Args) -> Result<()> {
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
 
-    // Load GGUF model via quantized VarBuilder
+    // ── Load GGUF model ──────────────────────────────────────────────────────
     println!("\nLoading quantized model from GGUF...");
     let vb = VarBuilder::from_gguf(gguf_path, &device)?;
-    let talker_config = TalkerConfig::default();
+    let talker_config = if args.custom_voice {
+        println!("Using CustomVoice config (hidden=2048, MRoPE)");
+        TalkerConfig::custom_voice()
+    } else {
+        TalkerConfig::default()
+    };
     let hidden_size = talker_config.hidden_size;
     let talker = QuantizedTalkerModel::from_gguf(vb.pp("talker"), talker_config, &device)?;
-    println!("QuantizedTalkerModel loaded (hidden_size={})", hidden_size,);
+    let t_gguf = phase.elapsed().as_secs_f64();
+    println!(
+        "QuantizedTalkerModel loaded (hidden_size={}) — {:.2}s",
+        hidden_size, t_gguf
+    );
+    phase = std::time::Instant::now();
 
-    // Load decoder weights (speech tokenizer)
+    // ── Load decoder ──────────────────────────────────────────────────────────
     let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
     let decoder_weights = load_weights(&decoder_path, &device)?;
-
     println!("Creating Decoder12Hz...");
     let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
+    let t_decoder = phase.elapsed().as_secs_f64();
+    println!("Decoder loaded — {:.2}s", t_decoder);
+    phase = std::time::Instant::now();
 
-    // Load tokenizer
+    // ── Load tokenizer & tokenize ─────────────────────────────────────────────
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
         .unwrap_or_else(|| args.model_dir.clone());
     println!("Loading tokenizer from {}...", tokenizer_dir);
     let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
-
-    // Tokenize text
     let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
-
     let speaker: Speaker = args.speaker.parse()?;
     let language: Language = args.language.parse()?;
     println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
-
     let num_frames = max_frames_from_args(args);
     println!("\nGenerating up to {} frames...", num_frames);
+    let t_tokenizer = phase.elapsed().as_secs_f64();
+    phase = std::time::Instant::now();
 
-    // Load code predictor from regular safetensors (not quantized — small model)
+    // ── Load code predictor ──────────────────────────────────────────────────
     println!("Loading code predictor weights from model.safetensors...");
     let model_path = Path::new(&args.model_dir).join("model.safetensors");
     let weights = load_weights(&model_path, &device)?;
     let cp_weights = filter_weights(&weights, "talker.code_predictor.");
     let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
-    let code_predictor = models::CodePredictor::new(models::CodePredictorConfig::default(), cp_vb)?;
+    let cp_config = if args.custom_voice {
+        models::CodePredictorConfig::custom_voice()
+    } else {
+        models::CodePredictorConfig::default()
+    };
+    let code_predictor = models::CodePredictor::new(cp_config, cp_vb)?;
+    let t_cp = phase.elapsed().as_secs_f64();
+    println!("Code predictor loaded — {:.2}s", t_cp);
+    phase = std::time::Instant::now();
 
     // Build trailing text embeddings
     let trailing_text_hidden = if input_ids.len() > 1 {
@@ -472,7 +493,12 @@ fn run_quantized(args: &Args) -> Result<()> {
     let prefill_len = hidden.dim(1)?;
     let mut offset = prefill_len;
     let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
-    println!("Prefill length: {} positions", prefill_len);
+    let t_prefill = phase.elapsed().as_secs_f64();
+    println!(
+        "Prefill done — {:.2}s ({} positions)",
+        t_prefill, prefill_len
+    );
+    phase = std::time::Instant::now();
 
     // Sample first semantic token
     let logits_2d = logits.squeeze(1)?;
@@ -549,7 +575,9 @@ fn run_quantized(args: &Args) -> Result<()> {
         semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
     }
 
+    let t_gen = phase.elapsed().as_secs_f64();
     progress.finish_with_message("Done generating codes");
+    phase = std::time::Instant::now();
 
     // Decode to audio
     println!("\nDecoding {} frames to audio...", all_codes.len());
@@ -566,9 +594,28 @@ fn run_quantized(args: &Args) -> Result<()> {
     let output_path = resolve_output_path(args, num_frames)?;
     let audio_buffer = AudioBuffer::new(audio_samples, 24000);
     audio_buffer.save(&output_path)?;
-    println!("Saved WAV to: {}", output_path.display());
+    let t_decode_save = phase.elapsed().as_secs_f64();
 
-    println!("\nGeneration complete!");
+    println!();
+    println!("=== Timing Summary ===");
+    println!("  Load GGUF:        {:>8.2}s", t_gguf);
+    println!("  Load decoder:     {:>8.2}s", t_decoder);
+    println!("  Tokenizer:        {:>8.2}s", t_tokenizer);
+    println!("  Load CP:          {:>8.2}s", t_cp);
+    println!("  Prefill:          {:>8.2}s", t_prefill);
+    println!(
+        "  Generation:       {:>8.2}s  ({} frames, {:.1}s/frame)",
+        t_gen,
+        all_codes.len(),
+        t_gen / all_codes.len().max(1) as f64
+    );
+    println!("  Decode + save:    {:>8.2}s", t_decode_save);
+    println!("  ──────────────────────────────────────");
+    println!(
+        "  Total:            {:>8.2}s",
+        start_all.elapsed().as_secs_f64()
+    );
+
     Ok(())
 }
 

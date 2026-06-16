@@ -86,6 +86,7 @@ pub mod audio;
 pub mod generation;
 #[cfg(feature = "hub")]
 pub mod hub;
+pub mod i18n;
 pub mod models;
 pub mod profiling;
 pub mod tokenizer;

@@ -25,6 +25,7 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transfor
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+gui = ["dep:eframe", "dep:egui", "dep:rodio"]
 profiling = ["dep:tracing-chrome"]
 
 [dependencies]
@@ -69,6 +70,11 @@ audioadapter-buffers = "2.0.0"
 tracing-chrome = { version = "0.7", optional = true }
 half = "2.7.1"
 
+# GUI (optional)
+eframe = { version = "0.30", optional = true }
+egui = { version = "0.30", optional = true }
+rodio = { version = "0.20", optional = true }
+
 [dev-dependencies]
 criterion = "0.8"
 approx = "0.5"
@@ -97,6 +103,11 @@ harness = false
 name = "e2e_bench"
 path = "benches/e2e_bench.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
 
 [profile.release]
 lto = true
