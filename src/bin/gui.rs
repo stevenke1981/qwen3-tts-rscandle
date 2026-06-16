@@ -23,8 +23,8 @@ use qwen3_tts::{parse_device, AudioBuffer, Qwen3TTS, SynthesisOptions};
 struct Progress {
     phase: String, // idle | loading | generating | saving | done | error
     elapsed_secs: f64,
-    #[allow(dead_code)]
     current_frame: usize,
+    total_frames: usize,
     result_path: Option<PathBuf>,
     error_msg: String,
 }
@@ -271,6 +271,21 @@ fn run_generation(
 
     let max_frames = (duration * 12.5) as usize;
 
+    let on_frame = {
+        let progress = progress.clone();
+        let max = max_frames;
+        // Set total_frames upfront for progress bar denominator
+        {
+            let mut p = progress.lock().unwrap();
+            p.total_frames = max;
+        }
+        Some(std::sync::Arc::new(move |frame_idx: usize, _total: usize| {
+            let mut p = progress.lock().unwrap();
+            p.current_frame = frame_idx + 1;
+            p.elapsed_secs = t0.elapsed().as_secs_f64();
+        }) as Arc<dyn Fn(usize, usize) + Send + Sync>)
+    };
+
     let options = SynthesisOptions {
         max_length: max_frames,
         temperature,
@@ -278,6 +293,7 @@ fn run_generation(
         top_p,
         repetition_penalty: rep_penalty,
         seed: Some(seed),
+        on_frame,
         ..Default::default()
     };
 
@@ -360,12 +376,37 @@ impl eframe::App for TtsApp {
             match p.phase.as_str() {
                 "loading" => {
                     ui.colored_label(Color32::YELLOW, tr.loading_model(p.elapsed_secs));
+                    // Spinner-style indeterminate progress bar
+                    ui.add(
+                        EguiProgressBar::new(0.5)
+                            .animate(true)
+                            .desired_width(ui.available_width()),
+                    );
                 }
                 "generating" => {
-                    ui.colored_label(Color32::YELLOW, tr.generating(p.elapsed_secs));
+                    let total = p.total_frames.max(1);
+                    let fraction = (p.current_frame as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                    let label = format!(
+                        "{}  {} / {} frames ({:.1}s)",
+                        tr.generating(p.elapsed_secs),
+                        p.current_frame,
+                        p.total_frames,
+                        p.elapsed_secs,
+                    );
+                    ui.colored_label(Color32::YELLOW, &label);
+                    ui.add(
+                        EguiProgressBar::new(fraction)
+                            .desired_width(ui.available_width())
+                            .text(format!("{:.0}%", fraction * 100.0)),
+                    );
                 }
                 "saving" => {
                     ui.colored_label(Color32::YELLOW, tr.saving());
+                    ui.add(
+                        EguiProgressBar::new(0.8)
+                            .animate(true)
+                            .desired_width(ui.available_width()),
+                    );
                 }
                 "done" => {
                     let name = p
@@ -375,6 +416,7 @@ impl eframe::App for TtsApp {
                         .map(|n| n.to_string_lossy())
                         .unwrap_or_default();
                     ui.colored_label(Color32::GREEN, tr.done(&name));
+                    ui.add(EguiProgressBar::new(1.0).desired_width(ui.available_width()));
                 }
                 "error" => {
                     ui.colored_label(Color32::RED, tr.error(&p.error_msg));

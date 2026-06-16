@@ -96,6 +96,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use models::codec::{Decoder12Hz, Encoder12Hz};
@@ -479,6 +480,7 @@ impl Qwen3TTS {
             &trailing_text_hidden,
             trailing_text_len,
             &tts_pad_embed,
+            options.on_frame,
         )?;
 
         sync_device(&self.device)?;
@@ -543,6 +545,7 @@ impl Qwen3TTS {
         trailing_text_hidden: &Tensor,
         trailing_text_len: usize,
         tts_pad_embed: &Tensor,
+        on_frame: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
     ) -> Result<FrameCodes> {
         // Pre-build the token suppression mask once (reused every frame)
         let suppression_mask = generation::build_suppression_mask(
@@ -612,6 +615,11 @@ impl Qwen3TTS {
                 0,
             )?;
             gpu_frames.push(frame_tensor);
+
+            // Fire progress callback (GUI progress bar updates)
+            if let Some(ref cb) = on_frame {
+                cb(frame_idx, gen_config.max_new_tokens);
+            }
 
             // Use GPU tensor directly for embedding lookup (avoids 15 CPU→GPU transfers)
             let acoustic_embed_sum = self
@@ -779,6 +787,7 @@ impl Qwen3TTS {
             &trailing_text_hidden,
             trailing_text_len,
             &tts_pad_embed,
+            options.on_frame,
         )?;
 
         // Decode to audio
@@ -865,6 +874,7 @@ impl Qwen3TTS {
             &trailing_text_hidden,
             trailing_text_len,
             &tts_pad_embed,
+            options.on_frame,
         )?;
 
         // Decode to audio
@@ -1018,6 +1028,7 @@ impl Qwen3TTS {
             &trailing_text_hidden,
             trailing_text_len,
             &tts_pad_embed,
+            options.on_frame,
         )?;
 
         // Prepend ref_codes for ICL decoder context (same fix as synthesize_voice_clone)
@@ -1787,7 +1798,7 @@ impl<'a> Iterator for StreamingSession<'a> {
 }
 
 /// Options for speech synthesis
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SynthesisOptions {
     /// Maximum number of frames to generate
     pub max_length: usize,
@@ -1807,6 +1818,30 @@ pub struct SynthesisOptions {
     pub min_new_tokens: usize,
     /// Random seed for deterministic generation. `None` = non-deterministic.
     pub seed: Option<u64>,
+    /// Optional callback invoked on each generated frame with `(frame_idx, total_frames)`.
+    /// Used for GUI progress bars and streaming progress tracking.
+    /// The callback is called from the generation thread after each frame is produced.
+    pub on_frame: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SynthesisOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynthesisOptions")
+            .field("max_length", &self.max_length)
+            .field("temperature", &self.temperature)
+            .field("top_k", &self.top_k)
+            .field("top_p", &self.top_p)
+            .field("repetition_penalty", &self.repetition_penalty)
+            .field("eos_token_id", &self.eos_token_id)
+            .field("chunk_frames", &self.chunk_frames)
+            .field("min_new_tokens", &self.min_new_tokens)
+            .field("seed", &self.seed)
+            .field(
+                "on_frame",
+                &self.on_frame.as_ref().map(|_| "Fn(frame, total)"),
+            )
+            .finish()
+    }
 }
 
 impl SynthesisOptions {
@@ -1836,6 +1871,7 @@ impl Default for SynthesisOptions {
             chunk_frames: 10, // ~800ms per chunk at 12.5 Hz
             min_new_tokens: 2,
             seed: None,
+            on_frame: None,
         }
     }
 }
@@ -1968,6 +2004,7 @@ mod tests {
             chunk_frames: 5,
             min_new_tokens: 0,
             seed: Some(42),
+            on_frame: None,
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);
