@@ -1,9 +1,13 @@
 # package.ps1 — Create Qwen3-TTS portable ZIP (CPU version)
+# Packs executables + default model (1.7B-CustomVoice) + shared components.
 
+$ErrorActionPreference = "Stop"
 $root = "D:\qwen3-tts-rscandle"
 $exeCli = "$root\target\release\generate_audio.exe"
 $exeGui = "$root\target\release\gui.exe"
-$model = "$root\test_data\model"
+$modelVariant = "$root\models\1.7B-CustomVoice"
+$modelSt  = "$root\models\speech_tokenizer"
+$modelTok = "$root\models\tokenizer"
 $out  = "$root\Qwen3-TTS-v0.4.0-win64.zip"
 $vcruntime  = "C:\Windows\System32\vcruntime140.dll"
 $vcruntime1 = "C:\Windows\System32\vcruntime140_1.dll"
@@ -12,11 +16,13 @@ $vcruntime1 = "C:\Windows\System32\vcruntime140_1.dll"
 $missing = @()
 if (-not (Test-Path $exeCli)) { $missing += "generate_audio.exe" }
 if (-not (Test-Path $exeGui)) { $missing += "gui.exe" }
-if (-not (Test-Path $model))  { $missing += "model/" }
+if (-not (Test-Path $modelVariant)) { $missing += "models/1.7B-CustomVoice/" }
+if (-not (Test-Path $modelSt))      { $missing += "models/speech_tokenizer/" }
+if (-not (Test-Path $modelTok))     { $missing += "models/tokenizer/" }
 if (-not (Test-Path $vcruntime))  { $missing += "vcruntime140.dll" }
 if (-not (Test-Path $vcruntime1)) { $missing += "vcruntime140_1.dll" }
 if ($missing.Count -gt 0) {
-    Write-Host "ERROR: Missing files: $($missing -join ', ')" -ForegroundColor Red
+    Write-Host "ERROR: Missing files:`n  $($missing -join "`n  ")" -ForegroundColor Red
     exit 1
 }
 
@@ -42,6 +48,20 @@ function Add-FileToZip($zip, $sourcePath, $entryName) {
     }
 }
 
+function Add-DirectoryToZip($zip, $sourceDir, $zipPrefix) {
+    $files = Get-ChildItem -LiteralPath $sourceDir -Recurse -File
+    $total = $files.Count
+    $i = 0
+    foreach ($f in $files) {
+        $i++
+        $relPath = "$zipPrefix/$($f.FullName.Substring($sourceDir.Length + 1))" -replace '\\', '/'
+        $pct = [math]::Round($i / $total * 100)
+        Write-Progress -Activity "Packing $zipPrefix" -Status "$relPath" -PercentComplete $pct -CurrentOperation "$i / $total"
+        Add-FileToZip $zip $f.FullName $relPath
+    }
+    Write-Progress -Activity "Packing $zipPrefix" -Completed
+}
+
 try {
     # --- generate_audio.exe (CLI) ---
     Write-Host "  Adding generate_audio.exe"
@@ -58,18 +78,17 @@ try {
         Add-FileToZip $zip $dll $name
     }
 
-    # --- model/ directory ---
-    $modelFiles = Get-ChildItem -LiteralPath $model -Recurse -File
-    $total = $modelFiles.Count
-    $i = 0
-    foreach ($f in $modelFiles) {
-        $i++
-        $relPath = "model/$($f.FullName.Substring($model.Length + 1))" -replace '\\', '/'
-        $pct = [math]::Round($i / $total * 100)
-        Write-Progress -Activity "Packing model files" -Status "$relPath" -PercentComplete $pct -CurrentOperation "$i / $total"
-        Add-FileToZip $zip $f.FullName $relPath
-    }
-    Write-Progress -Activity "Packing model files" -Completed
+    # --- models/1.7B-CustomVoice/ (default model variant) ---
+    Write-Host "  Packing models/1.7B-CustomVoice/ ..."
+    Add-DirectoryToZip $zip $modelVariant "models/1.7B-CustomVoice"
+
+    # --- models/speech_tokenizer/ (shared) ---
+    Write-Host "  Packing models/speech_tokenizer/ ..."
+    Add-DirectoryToZip $zip $modelSt "models/speech_tokenizer"
+
+    # --- models/tokenizer/ (shared) ---
+    Write-Host "  Packing models/tokenizer/ ..."
+    Add-DirectoryToZip $zip $modelTok "models/tokenizer"
 
     $finalSize = (Get-Item $out).Length
     Write-Host "Done! $( '{0:N1}' -f ($finalSize / 1GB) ) GB" -ForegroundColor Green
