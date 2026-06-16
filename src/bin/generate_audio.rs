@@ -22,8 +22,44 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 use models::talker::{Language, Speaker, TalkerConfig};
 use qwen3_tts::{
     device_info, generation, models, parse_device, tokenizer, AudioBuffer, ModelType,
-    ParsedModelConfig, QuantizedTalkerModel, Qwen3TTS, SynthesisOptions,
+    ParsedModelConfig, QuantizedCodePredictor, QuantizedTalkerModel, Qwen3TTS, SynthesisOptions,
 };
+
+/// Wrapper enum for F32 vs quantized code predictor
+enum CpVariant {
+    F32(models::CodePredictor),
+    Q(QuantizedCodePredictor),
+}
+
+impl CpVariant {
+    fn new_kv_caches(&self) -> Vec<models::AnyKVCache> {
+        match self {
+            Self::F32(cp) => cp.new_kv_caches(),
+            Self::Q(cp) => cp.new_kv_caches(),
+        }
+    }
+
+    fn generate_acoustic_codes(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cp_kv_caches: &mut [models::AnyKVCache],
+    ) -> anyhow::Result<Tensor> {
+        match self {
+            Self::F32(cp) => {
+                cp.generate_acoustic_codes(talker_hidden, semantic_embed, cp_kv_caches)
+            }
+            Self::Q(cp) => cp.generate_acoustic_codes(talker_hidden, semantic_embed, cp_kv_caches),
+        }
+    }
+
+    fn get_acoustic_embeddings_sum_from_tensor(&self, codes: &Tensor) -> anyhow::Result<Tensor> {
+        match self {
+            Self::F32(cp) => cp.get_acoustic_embeddings_sum_from_tensor(codes),
+            Self::Q(cp) => cp.get_acoustic_embeddings_sum_from_tensor(codes),
+        }
+    }
+}
 
 /// Generate reference audio with deterministic seed for comparison
 #[derive(Parser, Debug)]
@@ -444,17 +480,26 @@ fn run_quantized(args: &Args) -> Result<()> {
     phase = std::time::Instant::now();
 
     // ── Load code predictor ──────────────────────────────────────────────────
-    println!("Loading code predictor weights from model.safetensors...");
-    let model_path = Path::new(&args.model_dir).join("model.safetensors");
-    let weights = load_weights(&model_path, &device)?;
-    let cp_weights = filter_weights(&weights, "talker.code_predictor.");
-    let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
     let cp_config = if args.custom_voice {
         models::CodePredictorConfig::custom_voice()
     } else {
         models::CodePredictorConfig::default()
     };
-    let code_predictor = models::CodePredictor::new(cp_config, cp_vb)?;
+    let code_predictor = if vb.contains_key("talker.code_predictor.model.norm.weight") {
+        println!("Loading code predictor from GGUF (quantized)...");
+        CpVariant::Q(QuantizedCodePredictor::new(
+            cp_config,
+            vb.pp("talker.code_predictor"),
+        )?)
+    } else {
+        println!("Loading code predictor weights from model.safetensors...");
+        let model_path = Path::new(&args.model_dir).join("model.safetensors");
+        let weights = load_weights(&model_path, &device)?;
+        let cp_weights = filter_weights(&weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let cp = models::CodePredictor::new(cp_config, cp_vb)?;
+        CpVariant::F32(cp)
+    };
     let t_cp = phase.elapsed().as_secs_f64();
     println!("Code predictor loaded — {:.2}s", t_cp);
     phase = std::time::Instant::now();

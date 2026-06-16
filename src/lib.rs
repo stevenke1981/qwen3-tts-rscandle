@@ -112,8 +112,8 @@ pub use models::config::Qwen3TTSConfig;
 // StreamingSession is defined in this module, exported as top-level type
 pub use generation::SamplingContext;
 pub use models::quantized::{
-    QuantizedAttention, QuantizedDecoderLayer, QuantizedMLP, QuantizedTalkerModel,
-    QuantizedTextProjection,
+    QuantizedAttention, QuantizedCodePredictor, QuantizedDecoderLayer, QuantizedMLP,
+    QuantizedTalkerModel, QuantizedTextProjection,
 };
 pub use models::talker::{codec_tokens, special_tokens, tts_tokens, Language, Speaker};
 pub use models::{

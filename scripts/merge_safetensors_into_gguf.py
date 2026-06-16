@@ -22,13 +22,49 @@ from gguf import GGUFWriter, GGUFReader, GGMLQuantizationType
 # Which keys to extract from safetensors
 # Note: codec_embedding is already in GGUF from token_embd.weight mapping
 # Text embedding needs to come from safetensors (F16 to save space)
-NEEDED_KEYS = {
-    "talker.model.text_embedding.weight",   # [151936, 2048] → store as F16
-    "talker.text_projection.linear_fc1.weight",
-    "talker.text_projection.linear_fc1.bias",
-    "talker.text_projection.linear_fc2.weight",
-    "talker.text_projection.linear_fc2.bias",
-}
+
+def _build_cp_keys():
+    """Build all code predictor tensor keys (88 tensors total)."""
+    keys = set()
+    # Talker text components (for both base and custom_voice configs)
+    keys.update([
+        "talker.model.text_embedding.weight",   # [151936, 2048] → store as F16
+        "talker.text_projection.linear_fc1.weight",
+        "talker.text_projection.linear_fc1.bias",
+        "talker.text_projection.linear_fc2.weight",
+        "talker.text_projection.linear_fc2.bias",
+    ])
+    # Code predictor: codec embeddings (15 groups, one per acoustic group)
+    for i in range(15):
+        keys.add(f"talker.code_predictor.model.codec_embedding.{i}.weight")
+    # Code predictor: LM heads (15 groups)
+    for i in range(15):
+        keys.add(f"talker.code_predictor.lm_head.{i}.weight")
+    # Code predictor: 5 transformer layers, 11 tensors each
+    for layer in range(5):
+        keys.update([
+            f"talker.code_predictor.model.layers.{layer}.input_layernorm.weight",
+            f"talker.code_predictor.model.layers.{layer}.post_attention_layernorm.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.q_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.k_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.v_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.o_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.q_norm.weight",
+            f"talker.code_predictor.model.layers.{layer}.self_attn.k_norm.weight",
+            f"talker.code_predictor.model.layers.{layer}.mlp.gate_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.mlp.up_proj.weight",
+            f"talker.code_predictor.model.layers.{layer}.mlp.down_proj.weight",
+        ])
+    # Code predictor: final norm
+    keys.add("talker.code_predictor.model.norm.weight")
+    # Code predictor: small_to_mtp_projection (CustomVoice only)
+    keys.update([
+        "talker.code_predictor.small_to_mtp_projection.weight",
+        "talker.code_predictor.small_to_mtp_projection.bias",
+    ])
+    return keys
+
+NEEDED_KEYS = _build_cp_keys()
 
 def load_needed_tensors(safetensors_path: str) -> dict:
     """Load only needed tensors from safetensors.
