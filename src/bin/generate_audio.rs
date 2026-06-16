@@ -435,7 +435,38 @@ fn run_quantized(args: &Args) -> Result<()> {
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
 
-    // ── Load GGUF model ──────────────────────────────────────────────────────
+    // ── Parallel loading ─────────────────────────────────────────────────────
+    // Spawn decoder and tokenizer in background threads while loading GGUF (heaviest)
+    let decoder_handle = {
+        let device = device.clone();
+        let model_dir = args.model_dir.clone();
+        std::thread::spawn(move || -> anyhow::Result<models::codec::Decoder12Hz> {
+            let decoder_path = Path::new(&model_dir).join("speech_tokenizer/model.safetensors");
+            let decoder_weights = load_weights(&decoder_path, &device)?;
+            models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())
+        })
+    };
+
+    let tokenizer_handle = {
+        let tokenizer_dir = args
+            .tokenizer_dir
+            .clone()
+            .unwrap_or_else(|| args.model_dir.clone());
+        let text = args.text.clone();
+        let speaker_str = args.speaker.clone();
+        let language_str = args.language.clone();
+        std::thread::spawn(
+            move || -> anyhow::Result<(tokenizer::TextTokenizer, Vec<u32>, Speaker, Language)> {
+                let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+                let input_ids = text_tokenizer.encode(&text)?;
+                let speaker: Speaker = speaker_str.parse()?;
+                let language: Language = language_str.parse()?;
+                Ok((text_tokenizer, input_ids, speaker, language))
+            },
+        )
+    };
+
+    // Load GGUF on main thread (parallel with decoder + tokenizer)
     println!("\nLoading quantized model from GGUF...");
     let vb = VarBuilder::from_gguf(gguf_path, &device)?;
     let talker_config = if args.custom_voice {
@@ -451,33 +482,24 @@ fn run_quantized(args: &Args) -> Result<()> {
         "QuantizedTalkerModel loaded (hidden_size={}) — {:.2}s",
         hidden_size, t_gguf
     );
+
+    // Join parallel background tasks (should be instant since they ran alongside GGUF)
+    let decoder = match decoder_handle.join() {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("Decoder thread panicked"),
+    };
+    let (_text_tokenizer, input_ids, speaker, language) = match tokenizer_handle.join() {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("Tokenizer thread panicked"),
+    };
+    // Reset timer for next phase (exclude parallel load overhead)
     phase = std::time::Instant::now();
 
-    // ── Load decoder ──────────────────────────────────────────────────────────
-    let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
-    let decoder_weights = load_weights(&decoder_path, &device)?;
-    println!("Creating Decoder12Hz...");
-    let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
-    let t_decoder = phase.elapsed().as_secs_f64();
-    println!("Decoder loaded — {:.2}s", t_decoder);
-    phase = std::time::Instant::now();
-
-    // ── Load tokenizer & tokenize ─────────────────────────────────────────────
-    let tokenizer_dir = args
-        .tokenizer_dir
-        .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
-    println!("Loading tokenizer from {}...", tokenizer_dir);
-    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
-    let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
-    let speaker: Speaker = args.speaker.parse()?;
-    let language: Language = args.language.parse()?;
-    println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
     let num_frames = max_frames_from_args(args);
     println!("\nGenerating up to {} frames...", num_frames);
-    let t_tokenizer = phase.elapsed().as_secs_f64();
-    phase = std::time::Instant::now();
 
     // ── Load code predictor ──────────────────────────────────────────────────
     let cp_config = if args.custom_voice {
@@ -658,9 +680,7 @@ fn run_quantized(args: &Args) -> Result<()> {
 
     println!();
     println!("=== Timing Summary ===");
-    println!("  Load GGUF:        {:>8.2}s", t_gguf);
-    println!("  Load decoder:     {:>8.2}s", t_decoder);
-    println!("  Tokenizer:        {:>8.2}s", t_tokenizer);
+    println!("  Load GGUF+tok+dec: {:>8.2}s *", t_gguf);
     println!("  Load CP:          {:>8.2}s", t_cp);
     println!("  Prefill:          {:>8.2}s", t_prefill);
     println!(
